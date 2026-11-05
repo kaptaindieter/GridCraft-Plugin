@@ -1,0 +1,31 @@
+{
+  "plugin_name": "GridCraft-Plugin",
+  "target_application": "GridCraft",
+  "upstream_repository": "https://github.com/storytold/gridcraft",
+  "tested_vanilla_commit": "df137b8ee8cd68503681f759f59b4e30b2e0b048",
+  "tested_vanilla_commit_subject": "xlsx: repair repeated sheet names through a set of assigned names (#3211)",
+  "tested_vanilla_commit_date": "2026-11-03 10:53:20 -0500",
+  "standalone_plugin_modules": [
+    "crates/ui-egui/src/artcraft_agent.rs",
+    "crates/ui-egui/src/artcraft_mcp.rs",
+    "crates/ui-egui/src/artcraft_drive.rs",
+    "crates/ui-egui/src/artcraft_theme.rs"
+  ],
+  "hooked_vanilla_files": [
+    "apps/gridcraft-web/index.html",
+    "crates/ui-egui/Cargo.toml",
+    "crates/ui-egui/src/app.rs",
+    "crates/ui-egui/src/app/commands.rs",
+    "crates/ui-egui/src/app/prefs.rs",
+    "crates/ui-egui/src/backstage.rs",
+    "crates/ui-egui/src/backstage/options.rs",
+    "crates/ui-egui/src/dialogs/about.rs",
+    "crates/ui-egui/src/lib.rs",
+    "crates/ui-egui/src/ribbon.rs",
+    "crates/ui-egui/src/ribbon/title_bar.rs",
+    "crates/ui-egui/src/ribbon/view.rs",
+    "crates/ui-egui/src/tabs.rs",
+    "crates/ui-egui/src/theme.rs",
+    "crates/ui-egui/src/theme/font_setup.rs"
+  ]
+}

@@ -1,0 +1,753 @@
+diff --git a/apps/gridcraft-web/index.html b/apps/gridcraft-web/index.html
+index 321aa302..fd3ab86e 100644
+--- a/apps/gridcraft-web/index.html
++++ b/apps/gridcraft-web/index.html
+@@ -7,11 +7,47 @@
+   <link data-trunk rel="icon" href="../../assets/app-icon/gridcraft.ico" />
+   <link data-trunk rel="rust" data-bin="gridcraft-web" data-wasm-opt="z" data-weak-refs />
+   <style>
+-    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #f3f3f3; }
++    :root, [data-theme="dark"] {
++      --bg-base: #1f1f1f;
++      --bg-panel: #292929;
++      --text-main: #eeeeee;
++      --text-muted: #b0b0b0;
++      --accent: #3b5bdb;
++      --border: #3a3a3a;
++      --aurora-gradient: linear-gradient(135deg, #4facfe 0%, #9b72cb 35%, #d96570 70%, #f3a183 100%);
++      --aurora-subtle-glow: linear-gradient(135deg, rgba(79, 172, 254, 0.15), rgba(155, 114, 203, 0.15), rgba(217, 101, 112, 0.15));
++    }
++    [data-theme="light"] {
++      --bg-base: #f0f0f0;
++      --bg-panel: #ffffff;
++      --text-main: #242424;
++      --text-muted: #616161;
++      --accent: #3b5bdb;
++      --border: #e1e1e1;
++    }
++    [data-theme="aurora"] {
++      --bg-base: #0b0d14;
++      --bg-panel: #131622;
++      --text-main: #e4e6eb;
++      --text-muted: #8b92a5;
++      --accent: #9b72cb;
++      --border: #272c40;
++      --aurora-gradient: linear-gradient(135deg, #4facfe 0%, #9b72cb 35%, #d96570 70%, #f3a183 100%);
++      --aurora-subtle-glow: linear-gradient(135deg, rgba(79, 172, 254, 0.15), rgba(155, 114, 203, 0.15), rgba(217, 101, 112, 0.15));
++    }
++    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: var(--bg-base, #f3f3f3); }
+     #gridcraft_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+     #gridcraft_loading { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+       color: #555; font: 14px system-ui, sans-serif; pointer-events: none; }
+   </style>
++  <script>
++    (function() {
++      try {
++        var theme = localStorage.getItem("artcraft_theme") || "dark";
++        document.documentElement.setAttribute("data-theme", theme);
++      } catch (e) {}
++    })();
++  </script>
+ </head>
+ <body>
+   <canvas id="gridcraft_canvas"></canvas>
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index 297f7bab..c171cf9a 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -12,8 +12,11 @@ workspace = true
+ # The shared capture slot (`craft_ui::capture`) comes from the one craft-libs revision every
+ # craft-libs dependency uses (see the root Cargo.toml).
+ craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "c5a1cbfb5f9049f9270955caffb5bee5997aebf7" }
++rfd = { workspace = true }
+ gridcraft-engine = { workspace = true }
+ gridcraft-chart = { workspace = true }
++chrono = { workspace = true }
++ureq = { version = "3.5", features = ["rustls"] }
+ # `monochrome_emoji_fonts` restores the Noto Emoji and emoji-icon faces that 0.37 moved behind
+ # this feature. The UI draws ✕, ◀, ↘ and 📋 as text; without these faces the strict kittest
+ # harness (and a host with no symbol font) renders them as tofu.
+diff --git a/crates/ui-egui/src/app.rs b/crates/ui-egui/src/app.rs
+index 068be59a..c0cfe991 100644
+--- a/crates/ui-egui/src/app.rs
++++ b/crates/ui-egui/src/app.rs
+@@ -26,7 +26,11 @@ mod view;
+ impl SheetApp {
+     /// Constructs a `SheetApp` with default UI, grid, printing, control and screenshot state and the caller's session and services.
+     pub fn new(session: Session, services: Services) -> SheetApp {
++        let global_th = crate::artcraft_theme::AppTheme::load_global();
+         SheetApp {
++            app_theme: global_th,
++            artcraft_drive: crate::artcraft_drive::ArtCraftDrive::new("GridCraft", "xlsx"),
++            artcraft_agent: crate::artcraft_agent::ArtCraftAgent::new(),
+             session,
+             ui: UiState::default(),
+             chrome: Chrome::default(),
+@@ -34,7 +38,7 @@ impl SheetApp {
+             editor: None,
+             text_box_editor: None,
+             dialog: None,
+-            backstage: None,
++            backstage: Some(backstage::Backstage::new(backstage::Page::Home)),
+             message: None,
+             toast: None,
+             notice: None,
+@@ -96,9 +100,10 @@ impl SheetApp {
+     }
+ 
+     /// Sets up fonts and visuals for a specific persisted interface language.
+-    pub fn setup_context_for_language(ctx: &egui::Context, dark: bool, language: i18n::Language) {
++    pub fn setup_context_for_language(ctx: &egui::Context, _dark: bool, language: i18n::Language) {
+         ctx.set_fonts(theme::font_definitions_for_language(language));
+-        theme::apply(ctx, dark);
++        let global_th = crate::artcraft_theme::AppTheme::load_global();
++        theme::apply_app_theme(ctx, global_th);
+     }
+ 
+     /// Per-frame logic (control channel, screenshots). Call before `ui`.
+@@ -137,6 +142,8 @@ impl SheetApp {
+         // Files read asynchronously (web file picker, dropped files).
+         self.poll_async_opens();
+         self.autosave(ctx);
++        self.poll_artcraft_agent();
++        self.artcraft_autosave_tick();
+         self.update_title(ctx);
+         self.request_hidden_paint(ctx);
+         // One window always shows a workbook, unless each workbook has a native window of its own
+@@ -216,7 +223,16 @@ impl SheetApp {
+             ribbon::title_bar(self, ui);
+         }
+         if self.backstage.is_some() {
+-            // File tab: the Backstage view replaces everything below the title bar.
++            if self.ui.status_bar {
++                tabs::status_bar(self, ui);
++            }
++            let doc_summary = self.session.active().map(|d| {
++                let sheet_name = d.wb.active().map(|s| s.name.as_str()).unwrap_or("Sheet1");
++                let active_cell = d.selection.active.a1();
++                format!("Workbook: {} | Active sheet: {} | Active cell: {}", d.display_title(), sheet_name, active_cell)
++            }).unwrap_or_else(|| "Spreadsheet".into());
++            let proj_dir = self.artcraft_drive.active_project_dir().to_string_lossy().to_string();
++            self.artcraft_agent.render_sidebar(ui, &doc_summary, &proj_dir);
+             backstage::show(self, ui);
+         } else {
+             ribbon::show(self, ui);
+@@ -230,6 +246,13 @@ impl SheetApp {
+             tabs::sheet_tabs(self, ui);
+             pivot_pane::show(self, ui);
+             panes::show(self, ui);
++            let doc_summary = self.session.active().map(|d| {
++                let sheet_name = d.wb.active().map(|s| s.name.as_str()).unwrap_or("Sheet1");
++                let active_cell = d.selection.active.a1();
++                format!("Workbook: {} | Active sheet: {} | Active cell: {}", d.display_title(), sheet_name, active_cell)
++            }).unwrap_or_else(|| "Spreadsheet".into());
++            let proj_dir = self.artcraft_drive.active_project_dir().to_string_lossy().to_string();
++            self.artcraft_agent.render_sidebar(ui, &doc_summary, &proj_dir);
+             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.grid_bg)).show(ui, |ui| {
+                 let g0 = now_ms();
+                 grid::show(self, ui);
+@@ -295,6 +318,8 @@ impl SheetApp {
+     }
+ }
+ 
++include!("artcraft_mcp.rs");
++
+ #[cfg(test)]
+ mod lifecycle_tests {
+     use super::*;
+diff --git a/crates/ui-egui/src/app/commands.rs b/crates/ui-egui/src/app/commands.rs
+index c7dcde0f..81a1869f 100644
+--- a/crates/ui-egui/src/app/commands.rs
++++ b/crates/ui-egui/src/app/commands.rs
+@@ -166,8 +166,16 @@ impl SheetApp {
+                     Some(mode @ ("light" | "dark")) => {
+                         self.ui.dark = mode == "dark";
+                         self.ui.system_theme = false;
++                        self.app_theme = if mode == "dark" { crate::artcraft_theme::AppTheme::Dark } else { crate::artcraft_theme::AppTheme::Light };
++                        crate::artcraft_theme::AppTheme::save_global(self.app_theme);
+                     }
+-                    _ => return Some(Err("theme mode must be system, light, or dark".into())),
++                    Some("aurora") => {
++                        self.ui.dark = true;
++                        self.ui.system_theme = false;
++                        self.app_theme = crate::artcraft_theme::AppTheme::Aurora;
++                        crate::artcraft_theme::AppTheme::save_global(self.app_theme);
++                    }
++                    _ => return Some(Err("theme mode must be system, light, dark, or aurora".into())),
+                 }
+                 Ok(json!({"mode": self.ui.theme_mode()}))
+             }
+diff --git a/crates/ui-egui/src/app/prefs.rs b/crates/ui-egui/src/app/prefs.rs
+index 216e4a56..42bb896a 100644
+--- a/crates/ui-egui/src/app/prefs.rs
++++ b/crates/ui-egui/src/app/prefs.rs
+@@ -12,6 +12,14 @@ impl SheetApp {
+ 
+     /// Follows the desktop/system theme preference and records the effective theme.
+     pub(super) fn sync_theme_preference(&mut self, ctx: &egui::Context) {
++        if self.app_theme == crate::artcraft_theme::AppTheme::Aurora {
++            if ctx.options(|o| o.theme_preference) != egui::ThemePreference::Dark {
++                ctx.set_theme(egui::ThemePreference::Dark);
++                ctx.request_repaint();
++            }
++            self.effective_dark = true;
++            return;
++        }
+         let preference = match (
+             self.ui.system_theme,
+             ctx.system_theme().or_else(|| self.desktop_dark.map(|d| if d { egui::Theme::Dark } else { egui::Theme::Light })),
+diff --git a/crates/ui-egui/src/backstage.rs b/crates/ui-egui/src/backstage.rs
+index 194533d3..056b8c7c 100644
+--- a/crates/ui-egui/src/backstage.rs
++++ b/crates/ui-egui/src/backstage.rs
+@@ -128,6 +128,7 @@ pub struct Backstage {
+     pub save_format: &'static str,
+     /// Home and Open: when the recent workbooks were last changed.
+     recent: RecentFiles,
++    pub search_query: String,
+ }
+ 
+ /// Save As file types: (extension, label). The first is the workbook itself; the others are
+@@ -147,6 +148,7 @@ impl Backstage {
+             preview: None,
+             save_format: "xlsx",
+             recent: RecentFiles::default(),
++            search_query: String::new(),
+         }
+     }
+ }
+@@ -342,18 +344,26 @@ fn tile(ui: &mut Ui, label: &str, sample: Option<usize>) -> egui::Response {
+     resp
+ }
+ 
+-/// Blank workbook and the built-in samples.
++/// 5 Standardized Templates with Green Accent Cards
+ fn new_tiles(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome) {
+     let lang = app.ui.language;
++    let templates: [(&str, &str, Option<usize>); 5] = [
++        ("blank", "Blank Workbook", None),
++        ("financial-budget", "Financial Budget", Some(0)),
++        ("project-tracker", "Project Tracker", Some(1)),
++        ("invoice-kpi", "Invoice & KPI Dashboard", Some(2)),
++        ("data-analysis", "Data Analysis Sheet", Some(3)),
++    ];
++
+     ui.horizontal_wrapped(|ui| {
+         ui.spacing_mut().item_spacing = vec2(18.0, 14.0);
+-        if tile(ui, lang.tr("Blank workbook"), None).clicked() {
+-            app.run_or_alert("file.new", json!({}));
+-            out.close = true;
+-        }
+-        for (i, (name, title)) in gridcraft_engine::sample::SAMPLES.iter().enumerate() {
+-            if tile(ui, title, Some(i)).clicked() {
+-                app.run_or_alert("file.new", json!({"sample": name}));
++        for (key, title, sample) in templates {
++            if tile(ui, title, sample).clicked() {
++                if key == "blank" {
++                    app.run_or_alert("file.new", json!({}));
++                } else {
++                    app.run_or_alert("file.new", json!({"sample": key}));
++                }
+                 out.close = true;
+             }
+         }
+@@ -376,6 +386,11 @@ const MODIFIED_W: f32 = 150.0;
+ fn recent_list(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcome, limit: usize) {
+     let t = Tokens::get(ui.ctx());
+     let lang = app.ui.language;
++
++    // Prune missing files so deleted/moved workbooks disappear immediately.
++    #[cfg(not(target_arch = "wasm32"))]
++    app.ui.recent.retain(|p| std::path::Path::new(p).exists());
++
+     if app.ui.recent.is_empty() {
+         dim(ui, lang.tr("No recent workbooks yet."));
+         return;
+@@ -396,7 +411,13 @@ fn recent_list(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Ou
+         );
+     }
+     let now = crate::now_ms() / 1000.0;
+-    for path in app.ui.recent.iter().take(limit).cloned().collect::<Vec<_>>() {
++    let filter = bs.search_query.trim().to_lowercase();
++    let filtered_recent: Vec<String> = app.ui.recent.iter()
++        .filter(|p| filter.is_empty() || p.to_lowercase().contains(&filter))
++        .take(limit)
++        .cloned()
++        .collect();
++    for path in filtered_recent {
+         let (name, folder) = split_path(&path);
+         let (rect, resp) = ui.allocate_exact_size(vec2(width, 44.0), Sense::click());
+         resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &name));
+@@ -557,7 +578,16 @@ fn home(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcome)
+     section(ui, lang, "New");
+     new_tiles(app, ui, out);
+     ui.add_space(22.0);
+-    section(ui, lang, "Recent");
++    ui.horizontal(|ui| {
++        section(ui, lang, "Recent Files");
++        ui.add_space(20.0);
++        ui.add(
++            egui::TextEdit::singleline(&mut bs.search_query)
++                .hint_text("🔍 Search for a file")
++                .desired_width(220.0)
++                .margin(egui::Margin::symmetric(8, 4))
++        );
++    });
+     recent_list(app, ui, bs, out, 8);
+     if app.ui.recent.len() > 8 {
+         ui.add_space(6.0);
+diff --git a/crates/ui-egui/src/backstage/options.rs b/crates/ui-egui/src/backstage/options.rs
+index 6b9f70eb..d24c7695 100644
+--- a/crates/ui-egui/src/backstage/options.rs
++++ b/crates/ui-egui/src/backstage/options.rs
+@@ -39,17 +39,22 @@ pub(super) fn options(app: &mut SheetApp, ui: &mut Ui) {
+ fn general_options(app: &mut SheetApp, ui: &mut Ui, lang: Language) {
+     egui::Grid::new("backstage_options_general").num_columns(2).spacing(vec2(18.0, 10.0)).show(ui, |ui| {
+         let label = ui.label(lang.tr("Display theme"));
+-        let mode = app.ui.theme_mode();
++        let mode = if app.app_theme == crate::artcraft_theme::AppTheme::Aurora {
++            "aurora"
++        } else {
++            app.ui.theme_mode()
++        };
+         let current = match mode {
+             "system" => "System",
+             "dark" => "Dark",
++            "aurora" => "Aurora",
+             _ => "Light",
+         };
+         craft_ui::ComboBox::from_id_salt("backstage_theme")
+             .width(160.0)
+             .selected_text(lang.tr(current))
+             .show_ui(ui, |ui| {
+-                for (value, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark")] {
++                for (value, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark"), ("aurora", "Aurora")] {
+                     if ui.selectable_label(mode == value, lang.tr(label)).clicked() {
+                         app.run_or_alert("view.theme", json!({"mode": value}));
+                     }
+diff --git a/crates/ui-egui/src/dialogs/about.rs b/crates/ui-egui/src/dialogs/about.rs
+index a95878e9..b0b7c04c 100644
+--- a/crates/ui-egui/src/dialogs/about.rs
++++ b/crates/ui-egui/src/dialogs/about.rs
+@@ -20,7 +20,7 @@ pub(super) fn about(ui: &mut egui::Ui, d: &mut Dialog) {
+             ui.add_space(4.0);
+             ui.label("A clean-room, open-source, Rust-native spreadsheet. Part of ArtCraft.");
+             ui.hyperlink_to("getartcraft.com/apps/gridcraft", "https://getartcraft.com/apps/gridcraft");
+-            ui.hyperlink_to("Join the ArtCraft Discord", "https://discord.gg/artcraft");
++            // discord removed
+         }
+     }
+ }
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 2bf01611..0c58d76b 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -15,6 +15,8 @@ pub const UPDATE_APP: craft_update::app::App = craft_update::app::App {
+     ..craft_update::suite::GRIDCRAFT
+ };
+ 
++pub mod artcraft_agent;
++pub mod artcraft_drive;
+ pub mod backstage;
+ mod border_preview;
+ mod cell_pictures;
+@@ -75,6 +77,7 @@ pub use clock::{monotonic_ms, now_ms};
+ pub use services::{Chrome, Inbox, Services};
+ pub use state::{NoticeKind, OpenWindow, SaveAnswer, SheetView};
+ pub mod desktop_theme;
++pub mod artcraft_theme;
+ 
+ /// Persisted UI preferences.
+ #[derive(Clone, Debug, Serialize, Deserialize)]
+@@ -201,6 +204,9 @@ pub struct Perf {
+ }
+ 
+ pub struct SheetApp {
++    pub app_theme: crate::artcraft_theme::AppTheme,
++    pub artcraft_drive: artcraft_drive::ArtCraftDrive,
++    pub artcraft_agent: artcraft_agent::ArtCraftAgent,
+     pub session: Session,
+     pub ui: UiState,
+     /// The window chrome to draw (see [`Chrome`]).
+diff --git a/crates/ui-egui/src/ribbon.rs b/crates/ui-egui/src/ribbon.rs
+index b3ce9518..c26e6e0c 100644
+--- a/crates/ui-egui/src/ribbon.rs
++++ b/crates/ui-egui/src/ribbon.rs
+@@ -264,7 +264,7 @@ fn file_menu(app: &mut SheetApp, ui: &mut Ui) {
+ fn theme_choices(app: &mut SheetApp, ui: &mut Ui) {
+     let lang = app.ui.language;
+     let mode = app.ui.theme_mode();
+-    for (value, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark")] {
++    for (value, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark"), ("aurora", "Aurora")] {
+         if ui.radio(mode == value, lang.tr(label)).clicked() {
+             act(app, "view.theme", json!({"mode": value}));
+             ui.close();
+diff --git a/crates/ui-egui/src/ribbon/title_bar.rs b/crates/ui-egui/src/ribbon/title_bar.rs
+index 9f7c2197..2898ce00 100644
+--- a/crates/ui-egui/src/ribbon/title_bar.rs
++++ b/crates/ui-egui/src/ribbon/title_bar.rs
+@@ -1,3 +1,5 @@
++use egui::{Align2, Rect};
++use crate::icons;
+ use super::controls::{act, control_keytip};
+ use super::{Color32, Icon, Sense, SheetApp, Stroke, StrokeKind, Tokens, Ui, icon_button, json, pos2, small_button, theme, theme_choices, vec2};
+ 
+@@ -25,10 +27,10 @@ pub const MAC_CONTENT_LEFT: f32 = MAC_LIGHTS_LEFT + 2.0 * MAC_LIGHT_PITCH + MAC_
+ /// Leave room for the macOS traffic lights when the content extends into the title bar.
+ pub const TITLE_LEFT_PAD: f32 = if MAC { MAC_CONTENT_LEFT } else { 8.0 };
+ 
+-pub(super) const TITLE_BAR_H: f32 = if MAC { MAC_TITLE_BAR } else { 38.0 };
++pub(super) const TITLE_BAR_H: f32 = if MAC { MAC_TITLE_BAR } else { 40.0 };
+ 
+ /// The tallest title-bar controls, smaller on macOS to keep a margin in the shorter bar.
+-pub(super) const TITLE_CONTROL_H: f32 = if MAC { 22.0 } else { 26.0 };
++pub(super) const TITLE_CONTROL_H: f32 = if MAC { 22.0 } else { 28.0 };
+ 
+ /// Draws the title bar: drag/maximize, AutoSave toggle, Home/Save/Undo/Redo/More, search, share, comments and theme controls, with a centered truncated title.
+ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
+@@ -47,24 +49,13 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
+         }
+         ui.horizontal_centered(|ui| {
+             ui.add_space(TITLE_LEFT_PAD);
+-            // AutoSave toggle (saves after each change when the workbook has a file).
+-            ui.label(egui::RichText::new(app.ui.language.tr("AutoSave")).font(theme::ui_font(12.5)).color(t.text_dim));
+-            let on = app.ui.autosave;
+-            let (r, resp) = ui.allocate_exact_size(vec2(30.0, 16.0), Sense::click());
+-            ui.painter().rect_filled(r, 8.0, if on { t.accent } else { Color32::TRANSPARENT });
+-            ui.painter().rect_stroke(r, 8.0, Stroke::new(1.0, if on { t.accent } else { t.text_dim }), StrokeKind::Inside);
+-            let knob = if on { pos2(r.right() - 8.0, r.center().y) } else { pos2(r.left() + 8.0, r.center().y) };
+-            ui.painter().circle_filled(knob, 5.0, if on { t.on_accent } else { t.text_dim });
+-            if resp.on_hover_text(app.ui.language.tr("AutoSave: save after every change (workbooks saved to a file)")).clicked() {
+-                app.toggle_autosave();
+-            }
+-            ui.add_space(6.0);
+-            let __k = icon_button(ui, Icon::Home, t.text_dim, "Home", vec2(26.0, ch));
++            // Zone 1: Left Buttons - 🏠 Home, 💾 Save, ↩️ Undo, ↪️ Redo (28x28px)
++            let __k = icon_button(ui, Icon::Home, t.text_dim, "Home", vec2(28.0, ch));
+             control_keytip(app, ui, &__k, "start");
+             if __k.clicked() {
+-                app.open_dialog("start", json!({}));
++                app.open_backstage(crate::backstage::Page::Home);
+             }
+-            if icon_button(ui, Icon::Save, t.text_dim, "Save", vec2(26.0, ch)).clicked()
++            if icon_button(ui, Icon::Save, t.text_dim, "Save", vec2(28.0, ch)).clicked()
+                 // File operations must include the cell the user is still editing (as the File > Save menu item already does).
+                 && app.commit_edit(0, 0, false, false)
+             {
+@@ -75,7 +66,7 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
+             let can_undo = gridcraft_engine::cmd::can_undo(&app.session).is_ok();
+             let can_redo = gridcraft_engine::cmd::can_redo(&app.session).is_ok();
+             // Named and marked enabled or not for assistive technology (and the UI tests).
+-            let undo = icon_button(ui, Icon::Undo, if can_undo { t.text_dim } else { t.text_disabled }, "Undo", vec2(26.0, ch));
++            let undo = icon_button(ui, Icon::Undo, if can_undo { t.text_dim } else { t.text_disabled }, "Undo", vec2(28.0, ch));
+             undo.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, can_undo, "Undo"));
+             if undo.clicked() && can_undo {
+                 app.run_or_alert("edit.undo", json!({}));
+@@ -96,12 +87,12 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
+                     }
+                 }
+             });
+-            let redo = icon_button(ui, Icon::Redo, if can_redo { t.text_dim } else { t.text_disabled }, "Redo", vec2(26.0, ch));
++            let redo = icon_button(ui, Icon::Redo, if can_redo { t.text_dim } else { t.text_disabled }, "Redo", vec2(28.0, ch));
+             redo.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, can_redo, "Redo"));
+             if redo.clicked() && can_redo {
+                 app.run_or_alert("edit.redo", json!({}));
+             }
+-            let more = icon_button(ui, Icon::More, t.text_dim, "More commands", vec2(26.0, ch));
++            let more = icon_button(ui, Icon::More, t.text_dim, "More commands", vec2(28.0, ch));
+             egui::Popup::menu(&more).show(|ui| {
+                 for (label, id) in [
+                     ("New Workbook", "file.new"),
+@@ -121,9 +112,31 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
+             let left_end = ui.min_rect().right();
+             let right = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                 ui.add_space(8.0);
+-                let __k = icon_button(ui, Icon::Search, t.text_dim, "Search commands", vec2(28.0, ch));
+-                control_keytip(app, ui, &__k, "commandSearch");
+-                if __k.clicked() {
++
++                // Unified Top-Right Action Bar: ✓ Auto-Save | ● Google Drive: Active (G:) | ✨ AI Agent
++                let drive_active = app.artcraft_drive.is_drive_detected();
++                let proj_name = app.artcraft_drive.active_project_folder_name();
++                let proj_dir = app.artcraft_drive.active_project_dir();
++                crate::artcraft_theme::render_top_right_action_bar(
++                    ui,
++                    &mut app.artcraft_drive.auto_save_enabled,
++                    drive_active,
++                    &proj_name,
++                    &proj_dir,
++                    &mut app.artcraft_agent.is_open,
++                );
++                ui.add_space(8.0);
++
++                let (search_r, search_resp) = ui.allocate_exact_size(vec2(220.0, 28.0), Sense::click());
++                if search_resp.hovered() {
++                    ui.painter().rect_filled(search_r, 6.0, t.hover);
++                } else {
++                    ui.painter().rect_filled(search_r, 6.0, t.ribbon);
++                }
++                ui.painter().rect_stroke(search_r, 6.0, Stroke::new(1.0, t.ribbon_border), StrokeKind::Inside);
++                icons::paint(ui.painter(), Rect::from_center_size(pos2(search_r.min.x + 14.0, search_r.center().y), vec2(14.0, 14.0)), Icon::Search, t.text_dim);
++                ui.painter().text(pos2(search_r.min.x + 28.0, search_r.center().y), Align2::LEFT_CENTER, "Search commands and help", theme::ui_font(11.5), t.text_dim);
++                if search_resp.clicked() {
+                     app.open_dialog("commandSearch", json!({}));
+                 }
+                 let share = small_button(ui, Icon::Share, "Share", "Share: export or save a copy", true);
+@@ -144,16 +157,7 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
+                 if __k.clicked() {
+                     app.open_dialog("comments", json!({}));
+                 }
+-                // Quick light/dark switch (#194); right-click offers System as well. The same
+-                // choice lives in File › Display theme and the View tab.
+-                let lang = app.ui.language;
+-                let theme = icon_button(ui, Icon::Appearance, t.text_dim, "Dark Mode", vec2(28.0, 26.0));
+-                let dark = ui.ctx().theme() == egui::Theme::Dark;
+-                theme.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, dark, lang.tr("Dark Mode")));
+-                if theme.clicked() {
+-                    act(app, "view.darkMode", json!({}));
+-                }
+-                theme.context_menu(|ui| theme_choices(app, ui));
++                // Legacy theme button removed
+                 ui.min_rect().left()
+             });
+             // Centred title, cut with "…" so it never runs under the controls on either side.
+diff --git a/crates/ui-egui/src/ribbon/view.rs b/crates/ui-egui/src/ribbon/view.rs
+index 34fa582e..a0dcdc33 100644
+--- a/crates/ui-egui/src/ribbon/view.rs
++++ b/crates/ui-egui/src/ribbon/view.rs
+@@ -102,16 +102,22 @@ pub(super) fn view(app: &mut SheetApp, ui: &mut Ui) {
+     ui.vertical(|ui| {
+         let label_response = ui.label(lang.tr("Display theme"));
+         let mode = app.ui.theme_mode();
++        let mode = if app.app_theme == crate::artcraft_theme::AppTheme::Aurora {
++            "aurora"
++        } else {
++            mode
++        };
+         let label = match mode {
+             "system" => "System",
+             "dark" => "Dark",
++            "aurora" => "Aurora",
+             _ => "Light",
+         };
+         craft_ui::ComboBox::from_id_salt("display_theme")
+             .selected_text(lang.tr(label))
+-            .width(88.0)
++            .width(96.0)
+             .show_ui(ui, |ui| {
+-                for (value, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark")] {
++                for (value, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark"), ("aurora", "Aurora")] {
+                     if ui.selectable_label(mode == value, lang.tr(label)).clicked() {
+                         act(app, "view.theme", json!({"mode": value}));
+                     }
+diff --git a/crates/ui-egui/src/tabs.rs b/crates/ui-egui/src/tabs.rs
+index a730e77d..adfadb08 100644
+--- a/crates/ui-egui/src/tabs.rs
++++ b/crates/ui-egui/src/tabs.rs
+@@ -322,7 +322,7 @@ pub fn sheet_tabs(app: &mut SheetApp, ui: &mut Ui) {
+ /// Draws status mode/messages, zoom controls/view-mode buttons and selection statistics.
+ pub fn status_bar(app: &mut SheetApp, ui: &mut Ui) {
+     let t = Tokens::get(ui.ctx());
+-    egui::Panel::bottom("status_bar").exact_size(26.0).frame(egui::Frame::NONE.fill(t.status_bar).inner_margin(egui::Margin::symmetric(12, 0))).show(
++    egui::Panel::bottom("status_bar").exact_size(28.0).frame(egui::Frame::NONE.fill(t.status_bar).inner_margin(egui::Margin::symmetric(12, 0))).show(
+         ui,
+         |ui| {
+             // A right-click anywhere on the status bar opens the statistics menu, the text included, so its labels are not
+@@ -370,6 +370,14 @@ pub fn status_bar(app: &mut SheetApp, ui: &mut Ui) {
+                     }
+                 }
+                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++                    let mut cur_theme = app.app_theme;
++                    if crate::artcraft_theme::render_theme_switcher_dropdown(ui, &mut cur_theme) {
++                        app.app_theme = cur_theme;
++                        app.ui.dark = cur_theme != crate::artcraft_theme::AppTheme::Light;
++                        app.ui.system_theme = false;
++                        theme::apply_app_theme(ui.ctx(), cur_theme);
++                    }
++                    ui.add_space(8.0);
+                     // Zoom percentage and slider.
+                     let zoom = app.session.active().and_then(|d| d.wb.active().map(|s| s.zoom)).unwrap_or(100);
+                     let zl = ui.add(
+diff --git a/crates/ui-egui/src/theme.rs b/crates/ui-egui/src/theme.rs
+index f37eb0c3..18b264ff 100644
+--- a/crates/ui-egui/src/theme.rs
++++ b/crates/ui-egui/src/theme.rs
+@@ -179,36 +179,36 @@ impl Tokens {
+     fn palette(dark: bool) -> Tokens {
+         Tokens {
+             dark,
+-            window: pick(dark, Color32::from_rgb(0xF3, 0xF3, 0xF3), Color32::from_rgb(0x29, 0x29, 0x29)),
+-            ribbon: pick(dark, Color32::from_rgb(0xFF, 0xFF, 0xFF), Color32::from_rgb(0x33, 0x33, 0x33)),
+-            ribbon_border: pick(dark, Color32::from_rgb(0xE3, 0xE3, 0xE3), Color32::from_rgb(0x40, 0x40, 0x40)),
+-            text: pick(dark, Color32::from_rgb(0x24, 0x24, 0x24), Color32::from_rgb(0xEE, 0xEE, 0xEE)),
+-            text_dim: pick(dark, Color32::from_rgb(0x61, 0x61, 0x61), Color32::from_rgb(0xB0, 0xB0, 0xB0)),
+-            text_disabled: pick(dark, Color32::from_rgb(0xB0, 0xB0, 0xB0), Color32::from_rgb(0x70, 0x70, 0x70)),
++            window: pick(dark, Color32::from_rgb(0xF3, 0xF3, 0xF3), Color32::from_rgb(0x12, 0x12, 0x14)),
++            ribbon: pick(dark, Color32::from_rgb(0xFF, 0xFF, 0xFF), Color32::from_rgb(0x18, 0x18, 0x1B)),
++            ribbon_border: pick(dark, Color32::from_rgb(0xE3, 0xE3, 0xE3), Color32::from_rgb(0x27, 0x27, 0x2A)),
++            text: pick(dark, Color32::from_rgb(0x24, 0x24, 0x24), Color32::from_rgb(0xED, 0xED, 0xED)),
++            text_dim: pick(dark, Color32::from_rgb(0x61, 0x61, 0x61), Color32::from_rgb(0xA1, 0xA1, 0xAA)),
++            text_disabled: pick(dark, Color32::from_rgb(0xA1, 0xA1, 0xAA), Color32::from_rgb(0x71, 0x71, 0x7A)),
+             accent: pick(dark, Color32::from_rgb(0x10, 0x7C, 0x41), Color32::from_rgb(0x5C, 0xC5, 0x87)),
+             accent_dark: pick(dark, Color32::from_rgb(0x0B, 0x5E, 0x31), Color32::from_rgb(0x3F, 0xA8, 0x6C)),
+             accent_soft: pick(dark, Color32::from_rgb(0xDF, 0xF1, 0xE6), Color32::from_rgb(0x23, 0x45, 0x31)),
+-            hover: pick(dark, Color32::from_rgb(0xEB, 0xEB, 0xEB), Color32::from_rgb(0x42, 0x42, 0x42)),
+-            pressed: pick(dark, Color32::from_rgb(0xDD, 0xDD, 0xDD), Color32::from_rgb(0x4D, 0x4D, 0x4D)),
+-            separator: pick(dark, Color32::from_rgb(0xE0, 0xE0, 0xE0), Color32::from_rgb(0x48, 0x48, 0x48)),
++            hover: pick(dark, Color32::from_rgb(0xEB, 0xEB, 0xEB), Color32::from_rgb(0x27, 0x27, 0x2A)),
++            pressed: pick(dark, Color32::from_rgb(0xDD, 0xDD, 0xDD), Color32::from_rgb(0x32, 0x32, 0x38)),
++            separator: pick(dark, Color32::from_rgb(0xE0, 0xE0, 0xE0), Color32::from_rgb(0x27, 0x27, 0x2A)),
+             grid_bg: Color32::WHITE,
+-            desk: pick(dark, Color32::from_rgb(0xDE, 0xDE, 0xDE), Color32::from_rgb(0x3A, 0x3A, 0x3A)),
++            desk: pick(dark, Color32::from_rgb(0xDE, 0xDE, 0xDE), Color32::from_rgb(0x12, 0x12, 0x14)),
+             gridline: Color32::from_rgb(0xE1, 0xE1, 0xE1),
+-            header_bg: pick(dark, Color32::from_rgb(0xF8, 0xF8, 0xF8), Color32::from_rgb(0x30, 0x30, 0x30)),
+-            header_text: pick(dark, Color32::from_rgb(0x42, 0x42, 0x42), Color32::from_rgb(0xCC, 0xCC, 0xCC)),
++            header_bg: pick(dark, Color32::from_rgb(0xF8, 0xF8, 0xF8), Color32::from_rgb(0x18, 0x18, 0x1B)),
++            header_text: pick(dark, Color32::from_rgb(0x27, 0x27, 0x2A), Color32::from_rgb(0xCC, 0xCC, 0xCC)),
+             header_line: pick(dark, Color32::from_rgb(0xD6, 0xD6, 0xD6), Color32::from_rgb(0x45, 0x45, 0x45)),
+             header_sel_bg: pick(dark, Color32::from_rgb(0xE1, 0xE1, 0xE1), Color32::from_rgb(0x45, 0x45, 0x45)),
+             header_sel_text: pick(dark, Color32::from_rgb(0x0B, 0x5E, 0x31), Color32::from_rgb(0x6F, 0xD3, 0x9A)),
+             header_all_bg: pick(dark, Color32::from_rgb(0xC8, 0xE6, 0xD3), Color32::from_rgb(0x2E, 0x55, 0x3E)),
+             sel_fill: pick(dark, Color32::from_rgba_unmultiplied(0x10, 0x7C, 0x41, 0x1C), Color32::from_rgba_unmultiplied(0x10, 0x7C, 0x41, 0x24)),
+             sel_border: Color32::from_rgb(0x10, 0x7C, 0x41),
+-            input_bg: pick(dark, Color32::WHITE, Color32::from_rgb(0x1F, 0x1F, 0x1F)),
+-            input_border: pick(dark, Color32::from_rgb(0xD1, 0xD1, 0xD1), Color32::from_rgb(0x50, 0x50, 0x50)),
+-            tab_bar: pick(dark, Color32::from_rgb(0xF3, 0xF3, 0xF3), Color32::from_rgb(0x29, 0x29, 0x29)),
+-            tab_active: pick(dark, Color32::WHITE, Color32::from_rgb(0x3A, 0x3A, 0x3A)),
+-            status_bar: pick(dark, Color32::from_rgb(0xF3, 0xF3, 0xF3), Color32::from_rgb(0x29, 0x29, 0x29)),
++            input_bg: pick(dark, Color32::WHITE, Color32::from_rgb(0x20, 0x20, 0x24)),
++            input_border: pick(dark, Color32::from_rgb(0xD1, 0xD1, 0xD1), Color32::from_rgb(0x27, 0x27, 0x2A)),
++            tab_bar: pick(dark, Color32::from_rgb(0xF3, 0xF3, 0xF3), Color32::from_rgb(0x12, 0x12, 0x14)),
++            tab_active: pick(dark, Color32::WHITE, Color32::from_rgb(0x12, 0x12, 0x14)),
++            status_bar: pick(dark, Color32::from_rgb(0xF3, 0xF3, 0xF3), Color32::from_rgb(0x12, 0x12, 0x14)),
+             cell_text: Color32::BLACK,
+-            menu_bg: pick(dark, Color32::WHITE, Color32::from_rgb(0x30, 0x30, 0x30)),
++            menu_bg: pick(dark, Color32::WHITE, Color32::from_rgb(0x18, 0x18, 0x1B)),
+             shadow: pick(dark, Color32::from_black_alpha(40), Color32::from_black_alpha(90)),
+             danger: pick(dark, Color32::from_rgb(0xC4, 0x2B, 0x1C), Color32::from_rgb(0xFF, 0x95, 0x85)),
+             error_check_green: pick(dark, Color32::from_rgb(0x1E, 0x8E, 0x3E), Color32::from_rgb(0x4C, 0xC2, 0x6B)),
+@@ -247,8 +247,49 @@ impl Tokens {
+         }
+     }
+ 
++    pub fn aurora() -> Tokens {
++        let mut t = Tokens::palette(true);
++        t.dark = true;
++        t.window = Color32::from_rgb(0x09, 0x0B, 0x14);
++        t.ribbon = Color32::from_rgb(0x0F, 0x13, 0x22);
++        t.ribbon_border = Color32::from_rgba_unmultiplied(139, 92, 246, 56);
++        t.text = Color32::from_rgb(0xF1, 0xF3, 0xF9);
++        t.text_dim = Color32::from_rgb(0x94, 0xA3, 0xB8);
++        t.text_disabled = Color32::from_rgb(0x64, 0x74, 0x8B);
++        t.accent = Color32::from_rgb(0xA8, 0x55, 0xF7);
++        t.accent_dark = Color32::from_rgb(0x93, 0x33, 0xEA);
++        t.accent_soft = Color32::from_rgba_unmultiplied(168, 85, 247, 40);
++        t.hover = Color32::from_rgb(0x1E, 0x24, 0x40);
++        t.pressed = Color32::from_rgb(0x28, 0x30, 0x56);
++        t.separator = Color32::from_rgba_unmultiplied(139, 92, 246, 56);
++        t.input_bg = Color32::from_rgb(0x16, 0x1B, 0x30);
++        t.input_border = Color32::from_rgba_unmultiplied(139, 92, 246, 56);
++        t.tab_bar = Color32::from_rgb(0x09, 0x0B, 0x14);
++        t.tab_active = Color32::from_rgb(0x0F, 0x13, 0x22);
++        t.status_bar = Color32::from_rgb(0x09, 0x0B, 0x14);
++        t.menu_bg = Color32::from_rgb(0x16, 0x1B, 0x30);
++        t.header_bg = Color32::from_rgb(0x0F, 0x13, 0x22);
++        t.header_text = Color32::from_rgb(0x94, 0xA3, 0xB8);
++        t.header_line = Color32::from_rgba_unmultiplied(139, 92, 246, 56);
++        t.header_sel_bg = Color32::from_rgb(0x16, 0x1B, 0x30);
++        t.header_sel_text = Color32::from_rgb(0xA8, 0x55, 0xF7);
++        t.header_all_bg = Color32::from_rgb(0x1E, 0x24, 0x40);
++        t.sel_border = Color32::from_rgb(0xA8, 0x55, 0xF7);
++        t.sel_fill = Color32::from_rgba_unmultiplied(168, 85, 247, 40);
++        t.desk = Color32::from_rgb(0x09, 0x0B, 0x14);
++        t.on_accent = Color32::WHITE;
++        t
++    }
++
+     pub fn get(ctx: &egui::Context) -> Tokens {
+-        if ctx.global_style().visuals.dark_mode { Tokens::dark() } else { Tokens::light() }
++        let is_aurora = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("is_aurora")).unwrap_or(false));
++        if is_aurora {
++            Tokens::aurora()
++        } else if ctx.global_style().visuals.dark_mode {
++            Tokens::dark()
++        } else {
++            Tokens::light()
++        }
+     }
+ 
+     /// One colour of the category palette.
+@@ -279,12 +320,17 @@ pub fn contrast(a: Color32, b: Color32) -> f32 {
+ }
+ 
+ /// Installs light and dark token visuals in both theme slots, keeps the 2-3 px widget and 8-10 px window/menu corner radii from 0.36, and sets spacing, text styles and the active theme.
+-pub fn apply(ctx: &egui::Context, dark: bool) {
+-    // Install both palettes before System can switch between the style slots.
+-    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+-        let dark = theme == egui::Theme::Dark;
+-        let t = if dark { Tokens::dark() } else { Tokens::light() };
+-        let mut v = if dark { Visuals::dark() } else { Visuals::light() };
++pub fn apply_app_theme(ctx: &egui::Context, theme: crate::artcraft_theme::AppTheme) {
++    let is_aurora = theme == crate::artcraft_theme::AppTheme::Aurora;
++    ctx.data_mut(|d| d.insert_temp(egui::Id::new("is_aurora"), is_aurora));
++    for t_kind in [egui::Theme::Light, egui::Theme::Dark] {
++        let is_d = t_kind == egui::Theme::Dark;
++        let t = if is_d {
++            if is_aurora { Tokens::aurora() } else { Tokens::dark() }
++        } else {
++            Tokens::light()
++        };
++        let mut v = if is_d { Visuals::dark() } else { Visuals::light() };
+         v.panel_fill = t.window;
+         v.window_fill = t.menu_bg;
+         v.extreme_bg_color = t.input_bg;
+@@ -297,7 +343,6 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
+         v.widgets.hovered.weak_bg_fill = t.hover;
+         v.widgets.active.weak_bg_fill = t.pressed;
+         v.widgets.inactive.bg_stroke = Stroke::new(1.0, t.input_border);
+-        // 0.37 raises the default widget corner radii; GridCraft keeps its 0.36 shape (#8617).
+         v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(2);
+         v.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
+         v.widgets.hovered.corner_radius = egui::CornerRadius::same(3);
+@@ -306,10 +351,10 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
+         v.window_corner_radius = egui::CornerRadius::same(10);
+         v.menu_corner_radius = egui::CornerRadius::same(8);
+         v.popup_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 16, spread: 0, color: t.shadow };
+-        ctx.set_visuals_of(theme, v);
++        ctx.set_visuals_of(t_kind, v);
+     }
+     ctx.options_mut(|o| o.fallback_theme = egui::Theme::Light);
+-    ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
++    ctx.set_theme(if theme == crate::artcraft_theme::AppTheme::Light { egui::Theme::Light } else { egui::Theme::Dark });
+     ctx.all_styles_mut(|s| {
+         s.spacing.item_spacing = egui::vec2(6.0, 4.0);
+         s.spacing.button_padding = egui::vec2(6.0, 3.0);
+@@ -322,6 +367,10 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
+     });
+ }
+ 
++pub fn apply(ctx: &egui::Context, dark: bool) {
++    apply_app_theme(ctx, if dark { crate::artcraft_theme::AppTheme::Dark } else { crate::artcraft_theme::AppTheme::Light });
++}
++
+ /// Model colour → egui colour.
+ pub fn color32(rgb: [u8; 3]) -> Color32 {
+     Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+diff --git a/crates/ui-egui/src/theme/font_setup.rs b/crates/ui-egui/src/theme/font_setup.rs
+index 916ba402..55b0d1d0 100644
+--- a/crates/ui-egui/src/theme/font_setup.rs
++++ b/crates/ui-egui/src/theme/font_setup.rs
+@@ -470,6 +470,12 @@ fn font_definitions_impl(language: crate::i18n::Language, used: &[String], syste
+     // Only families egui still has data for count as bound (a dropped face can empty a chain).
+     bound.retain(|f| fonts.families.get(&FontFamily::Name(f.as_str().into())).is_some_and(|c| !c.is_empty()));
+     crate::fonts::set_bound(bound);
++    #[cfg(target_os = "windows")]
++    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") {
++        fonts.font_data.insert("seguiemj".into(), Arc::new(FontData::from_owned(bytes)));
++        fonts.families.entry(FontFamily::Proportional).or_default().push("seguiemj".into());
++        fonts.families.entry(FontFamily::Monospace).or_default().push("seguiemj".into());
++    }
+     fonts
+ }
+ 
